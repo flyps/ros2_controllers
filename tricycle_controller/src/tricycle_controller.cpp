@@ -202,26 +202,50 @@ controller_interface::return_type TricycleController::update(
   // Compute wheel velocity and angle
   auto [alpha_write, Ws_write] = twist_to_ackermann(linear_command, angular_command);
 
+  auto & last_command = previous_commands_.back();
+  auto & second_to_last_command = previous_commands_.front();
+
+  double alpha_write_unclamped = alpha_write;
+  double Ws_write_unclamped = Ws_write;
+
+  // Apply only position limit on steering before scaling
+  limiter_steering_.limit_position(alpha_write);
+
+  // Recompute Ws_write with clamped alpha to maintain kinematic consistency
+  if (alpha_write != alpha_write_unclamped && std::abs(alpha_write) < M_PI_2 - 0.01) {
+    Ws_write = linear_command / (wheel_params_.radius * std::cos(alpha_write));
+  }
+
+  RCLCPP_DEBUG_THROTTLE(
+    get_node()->get_logger(),
+    *get_node()->get_clock(),
+    2000,
+    "linear_command: %.4f, angular_command: %.4f => alpha_unclamped: %.4f, alpha_clamped: %.4f, Ws_unclamped: %.4f, Ws_recalc: %.4f",
+    linear_command, angular_command, alpha_write_unclamped, alpha_write, Ws_write_unclamped, Ws_write);
+
   // Reduce wheel speed until the target angle has been reached
   double alpha_delta = abs(alpha_write - alpha_read);
   double scale;
-  if (alpha_delta < M_PI / 6)
+  double alpha_delta_full_speed = 0.0873; // 5 deg.
+  double alpha_delta_zero_speed = 0.349;  // 20 deg.
+  if (alpha_delta < alpha_delta_full_speed)
   {
     scale = 1;
   }
-  else if (alpha_delta > M_PI_2)
+  else if (alpha_delta > alpha_delta_zero_speed)
   {
-    scale = 0.01;
+    scale = 0.0;
   }
   else
   {
-    // TODO(anyone): find the best function, e.g convex power functions
-    scale = cos(alpha_delta);
+    scale = 1 - (alpha_delta - alpha_delta_full_speed)/(alpha_delta_zero_speed - alpha_delta_full_speed);
   }
+
+  double Ws_write_before_scale = Ws_write;
   Ws_write *= scale;
 
-  auto & last_command = previous_commands_.back();
-  auto & second_to_last_command = previous_commands_.front();
+  // Apply full limiters after scaling
+  double Ws_write_after_scale_before_limit = Ws_write;
 
   limiter_traction_.limit(
     Ws_write, last_command.speed, second_to_last_command.speed, period.seconds());
@@ -229,6 +253,13 @@ controller_interface::return_type TricycleController::update(
   limiter_steering_.limit(
     alpha_write, last_command.steering_angle, second_to_last_command.steering_angle,
     period.seconds());
+
+  RCLCPP_DEBUG_THROTTLE(
+    get_node()->get_logger(),
+    *get_node()->get_clock(),
+    2000,
+    "[CONTROL] alpha_read: %.4f, alpha_write: %.4f, alpha_delta: %.4f, scale: %.4f, speed_read: %.4f, speed_before_scale: %.4f, speed_after_scale: %.4f, speed_after_limit: %.4f",
+    alpha_read, alpha_write, alpha_delta, scale, Ws_read, Ws_write_before_scale, Ws_write_after_scale_before_limit, Ws_write);
 
   previous_commands_.pop();
   AckermannDrive ackermann_command;
@@ -251,6 +282,7 @@ controller_interface::return_type TricycleController::update(
 
   traction_joint_[0].velocity_command.get().set_value(Ws_write);
   steering_joint_[0].position_command.get().set_value(alpha_write);
+
   return controller_interface::return_type::OK;
 }
 
